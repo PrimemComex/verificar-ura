@@ -169,17 +169,10 @@ exports.handler = async (event) => {
 // FUNÇÃO AUXILIAR: Atualizar campo "Passou pela URA" no negócio
 // ----------------------------------------------------------
 async function updateDealField(webhookUrl, dealId, value) {
-  const res = await fetch(`${webhookUrl}/crm.deal.update`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      id: dealId,
-      fields: {
-        UF_CRM_1772056801: value,
-      },
-    }),
-  });
+  const url = `${webhookUrl}/crm.deal.update?id=${dealId}&fields[UF_CRM_1772056801]=${encodeURIComponent(value)}`;
+  console.log("URL de atualização:", url);
+  const res = await fetch(url);
   const data = await res.json();
-  console.log("Atualização do negócio:", data.result ? "OK" : "FALHOU");
+  console.log("Atualização do negócio:", JSON.stringify(data));
   return data;
 }
