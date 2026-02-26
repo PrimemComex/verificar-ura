@@ -103,7 +103,8 @@ exports.handler = async (event) => {
 
 // ATUALIZAR CAMPO NO NEGÓCIO
 async function updateDeal(webhookUrl, dealId, fieldCode, value) {
-  const url = `${webhookUrl}/crm.deal.update?id=${dealId}&fields[${fieldCode}]=${encodeURIComponent(value)}`;
+  const enumValue = value === "Sim" ? "1687" : "1689";
+  const url = `${webhookUrl}/crm.deal.update?id=${dealId}&fields[${fieldCode}]=${enumValue}`;
   console.log("Update URL:", url);
   try {
     const res = await fetch(url);
