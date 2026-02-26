@@ -1,12 +1,13 @@
 // =============================================================
-// VERIFICAR URA - Primem Comex - v2
+// VERIFICAR URA - Primem Comex - v3
+// Matching por horário mais próximo da criação do negócio
 // =============================================================
 
 exports.handler = async (event) => {
   const BITRIX_WEBHOOK = "https://primem.bitrix24.com.br/rest/89/9kjhemihvx0oz752";
   const CAMPO_URA = "UF_CRM_1772056801";
 
-  console.log("=== VERIFICAR URA v2 - INÍCIO ===");
+  console.log("=== VERIFICAR URA v3 - INÍCIO ===");
 
   try {
     // 1. EXTRAIR DEAL ID
@@ -48,10 +49,10 @@ exports.handler = async (event) => {
     const phoneDigits = phone.replace(/\D/g, "");
     console.log("Telefone:", phone, "Dígitos:", phoneDigits);
 
-    // 3. BUSCAR ATIVIDADES NO SPA 655
+    // 3. BUSCAR ATIVIDADES NO SPA 655 (últimas 2 horas)
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
-    const spaUrl = `${BITRIX_WEBHOOK}/crm.activity.list?filter[OWNER_TYPE_ID]=14&filter[OWNER_ID]=655&filter[PROVIDER_ID]=VOXIMPLANT_CALL&filter[>CREATED]=${encodeURIComponent(twoHoursAgo)}&order[ID]=DESC&select[]=ID&select[]=SETTINGS&select[]=SUBJECT&select[]=START_TIME`;
+    const spaUrl = `${BITRIX_WEBHOOK}/crm.activity.list?filter[OWNER_TYPE_ID]=14&filter[OWNER_ID]=655&filter[PROVIDER_ID]=VOXIMPLANT_CALL&filter[>CREATED]=${encodeURIComponent(twoHoursAgo)}&order[ID]=DESC&select[]=ID&select[]=SETTINGS&select[]=SUBJECT&select[]=START_TIME&select[]=CREATED`;
 
     console.log("Buscando atividades no SPA...");
     const spaRes = await fetch(spaUrl);
@@ -60,29 +61,52 @@ exports.handler = async (event) => {
     const activities = spaData.result || [];
     console.log("Atividades encontradas:", activities.length);
 
-    // 4. ENCONTRAR ATIVIDADE DO TELEFONE
-    let passouURA = "Não";
-
-    const matching = activities.find((act) => {
+    // 4. FILTRAR POR TELEFONE
+    const matchingActivities = activities.filter((act) => {
       const subjectDigits = (act.SUBJECT || "").replace(/\D/g, "");
       return subjectDigits.includes(phoneDigits);
     });
 
-    if (matching) {
-      console.log("Atividade encontrada:", matching.ID, "SETTINGS:", JSON.stringify(matching.SETTINGS));
-      if (matching.SETTINGS?.MISSED_CALL === true) {
+    console.log("Atividades do mesmo telefone:", matchingActivities.length);
+
+    // 5. ENCONTRAR A MAIS PRÓXIMA DO HORÁRIO DE CRIAÇÃO DO NEGÓCIO
+    let passouURA = "Não";
+    let bestMatch = null;
+
+    if (matchingActivities.length > 0 && dateCreate) {
+      const dealTime = new Date(dateCreate).getTime();
+
+      let minDiff = Infinity;
+      for (const act of matchingActivities) {
+        const actTime = new Date(act.CREATED || act.START_TIME).getTime();
+        const diff = Math.abs(dealTime - actTime);
+        if (diff < minDiff) {
+          minDiff = diff;
+          bestMatch = act;
+        }
+      }
+
+      if (bestMatch) {
+        console.log("Melhor match: ID", bestMatch.ID, "Criado:", bestMatch.CREATED, "Diff:", Math.round(minDiff / 1000), "segundos");
+        console.log("SETTINGS:", JSON.stringify(bestMatch.SETTINGS));
+
+        if (bestMatch.SETTINGS?.MISSED_CALL === true) {
+          passouURA = "Sim";
+        }
+      }
+    } else if (matchingActivities.length === 1) {
+      bestMatch = matchingActivities[0];
+      if (bestMatch.SETTINGS?.MISSED_CALL === true) {
         passouURA = "Sim";
       }
-    } else {
-      console.log("Nenhuma atividade correspondente encontrada");
     }
 
     console.log("Resultado: passouURA =", passouURA);
 
-    // 5. ATUALIZAR CAMPO NO NEGÓCIO
+    // 6. ATUALIZAR CAMPO NO NEGÓCIO
     const updateResult = await updateDeal(BITRIX_WEBHOOK, dealId, CAMPO_URA, passouURA);
 
-    console.log("=== VERIFICAR URA v2 - FIM ===");
+    console.log("=== VERIFICAR URA v3 - FIM ===");
 
     return {
       statusCode: 200,
@@ -91,7 +115,9 @@ exports.handler = async (event) => {
         dealId,
         phone,
         passouURA,
-        activityFound: matching?.ID || null,
+        activityFound: bestMatch?.ID || null,
+        activityCreated: bestMatch?.CREATED || null,
+        dealCreated: dateCreate,
         updateResult,
       }),
     };
