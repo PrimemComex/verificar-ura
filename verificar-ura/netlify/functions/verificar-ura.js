@@ -1,144 +1,271 @@
-// =============================================================
-// VERIFICAR URA - Primem Comex - v3
-// Matching por horário mais próximo da criação do negócio
-// =============================================================
+// verificar-ura.js - v4
+// Verifica se o cliente interagiu com a URA analisando o CALL_LOG do Voximplant
+// Busca por evento "Call.ToneReceived" (pressionamento de tecla DTMF)
+// 
+// HISTÓRICO:
+// v1 - Matching por primeiro resultado
+// v2 - URL hardcoded, método GET para atualização
+// v3 - Matching por horário mais próximo
+// v4 - Análise do CALL_LOG do Voximplant para detectar DTMF (resolve spam com MISSED_CALL:true)
+
+const BITRIX_WEBHOOK = "https://primem.bitrix24.com.br/rest/89/9kjhemihvx0oz752";
 
 exports.handler = async (event) => {
-  const BITRIX_WEBHOOK = "https://primem.bitrix24.com.br/rest/89/9kjhemihvx0oz752";
-  const CAMPO_URA = "UF_CRM_1772056801";
-
-  console.log("=== VERIFICAR URA v3 - INÍCIO ===");
-
   try {
-    // 1. EXTRAIR DEAL ID
-    let dealId;
-    if (event.queryStringParameters?.dealId) {
+    // 1. Receber o dealId
+    let dealId = null;
+
+    // Tenta pegar do query string (GET)
+    if (event.queryStringParameters && event.queryStringParameters.dealId) {
       dealId = event.queryStringParameters.dealId;
-    } else if (event.body) {
-      const params = new URLSearchParams(event.body);
-      dealId = params.get("dealId") || params.get("document_id");
+    }
+
+    // Tenta pegar do body (POST)
+    if (!dealId && event.body) {
+      try {
+        const body = JSON.parse(event.body);
+        dealId = body.dealId || body.DEAL_ID || body.deal_id;
+      } catch (e) {
+        // Body pode ser form-encoded
+        const params = new URLSearchParams(event.body);
+        dealId = params.get("dealId") || params.get("DEAL_ID");
+      }
     }
 
     if (!dealId) {
-      return { statusCode: 400, body: JSON.stringify({ error: "dealId não encontrado" }) };
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ error: "dealId não fornecido" }),
+      };
     }
 
-    console.log("Deal ID:", dealId);
+    console.log(`[v4] Processando deal: ${dealId}`);
 
-    // 2. BUSCAR DADOS DO NEGÓCIO
+    // 2. Buscar dados do negócio
     const dealRes = await fetch(`${BITRIX_WEBHOOK}/crm.deal.get?id=${dealId}`);
     const dealData = await dealRes.json();
-    const title = dealData.result?.TITLE || "";
-    const dateCreate = dealData.result?.DATE_CREATE || "";
 
-    console.log("Título:", title);
-    console.log("Data criação:", dateCreate);
+    if (!dealData.result) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: "Negócio não encontrado", dealId }),
+      };
+    }
 
-    // Extrair telefone do título
-    const phoneMatch = title.match(/- (.+?) - Chamada/);
+    const dealTitle = dealData.result.TITLE;
+    const dealCreated = dealData.result.DATE_CREATE;
+    console.log(`[v4] Título: ${dealTitle}`);
+    console.log(`[v4] Criado em: ${dealCreated}`);
+
+    // 3. Extrair telefone do título
+    const phoneMatch = dealTitle.match(/- (.+?) - Chamada/);
     if (!phoneMatch) {
-      console.log("Telefone não encontrado no título");
-      const updateResult = await updateDeal(BITRIX_WEBHOOK, dealId, CAMPO_URA, "Não");
+      console.log(`[v4] Não foi possível extrair telefone do título`);
       return {
         statusCode: 200,
-        body: JSON.stringify({ status: "phone_not_found", dealId, passouURA: "Não", updateResult }),
+        body: JSON.stringify({
+          status: "error",
+          dealId,
+          message: "Telefone não encontrado no título",
+        }),
       };
     }
 
     const phone = phoneMatch[1].trim();
     const phoneDigits = phone.replace(/\D/g, "");
-    console.log("Telefone:", phone, "Dígitos:", phoneDigits);
+    console.log(`[v4] Telefone: ${phone} (dígitos: ${phoneDigits})`);
 
-    // 3. BUSCAR ATIVIDADES NO SPA 655 (últimas 2 horas)
-    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    // 4. Buscar atividades de chamada no SPA 655 (últimas 2 horas)
+    const dealDate = new Date(dealCreated);
+    const searchFrom = new Date(dealDate.getTime() - 2 * 60 * 60 * 1000);
+    const searchFromISO = searchFrom.toISOString();
 
-    const spaUrl = `${BITRIX_WEBHOOK}/crm.activity.list?filter[OWNER_TYPE_ID]=14&filter[OWNER_ID]=655&filter[PROVIDER_ID]=VOXIMPLANT_CALL&filter[>CREATED]=${encodeURIComponent(twoHoursAgo)}&order[ID]=DESC&select[]=ID&select[]=SETTINGS&select[]=SUBJECT&select[]=START_TIME&select[]=CREATED`;
+    const actUrl =
+      `${BITRIX_WEBHOOK}/crm.activity.list` +
+      `?filter[OWNER_TYPE_ID]=14` +
+      `&filter[OWNER_ID]=655` +
+      `&filter[PROVIDER_ID]=VOXIMPLANT_CALL` +
+      `&filter[>CREATED]=${searchFromISO}` +
+      `&order[ID]=DESC` +
+      `&select[]=ID&select[]=SETTINGS&select[]=SUBJECT` +
+      `&select[]=START_TIME&select[]=CREATED&select[]=ORIGIN_ID`;
 
-    console.log("Buscando atividades no SPA...");
-    const spaRes = await fetch(spaUrl);
-    const spaData = await spaRes.json();
+    const actRes = await fetch(actUrl);
+    const actData = await actRes.json();
 
-    const activities = spaData.result || [];
-    console.log("Atividades encontradas:", activities.length);
+    console.log(`[v4] Atividades encontradas: ${actData.result ? actData.result.length : 0}`);
 
-    // 4. FILTRAR POR TELEFONE
-    const matchingActivities = activities.filter((act) => {
-      const subjectDigits = (act.SUBJECT || "").replace(/\D/g, "");
-      return subjectDigits.includes(phoneDigits);
-    });
+    if (!actData.result || actData.result.length === 0) {
+      // Nenhuma atividade encontrada — marca como "Não" (seguro)
+      await atualizarCampo(dealId, "1689");
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
+          status: "ok",
+          dealId,
+          passouURA: "Não",
+          motivo: "Nenhuma atividade encontrada",
+        }),
+      };
+    }
 
-    console.log("Atividades do mesmo telefone:", matchingActivities.length);
+    // 5. Filtrar pelo número de telefone e encontrar a mais próxima
+    const dealTime = dealDate.getTime();
+    let closestActivity = null;
+    let closestDiff = Infinity;
 
-    // 5. ENCONTRAR A MAIS PRÓXIMA DO HORÁRIO DE CRIAÇÃO DO NEGÓCIO
-    let passouURA = "Não";
-    let bestMatch = null;
-
-    if (matchingActivities.length > 0 && dateCreate) {
-      const dealTime = new Date(dateCreate).getTime();
-
-      let minDiff = Infinity;
-      for (const act of matchingActivities) {
-        const actTime = new Date(act.CREATED || act.START_TIME).getTime();
-        const diff = Math.abs(dealTime - actTime);
-        if (diff < minDiff) {
-          minDiff = diff;
-          bestMatch = act;
-        }
+    for (const act of actData.result) {
+      // Comparar telefone (por dígitos)
+      const actPhone = (act.SUBJECT || "").replace(/\D/g, "");
+      if (!actPhone.includes(phoneDigits.slice(-8))) {
+        continue; // Telefone diferente
       }
 
-      if (bestMatch) {
-        console.log("Melhor match: ID", bestMatch.ID, "Criado:", bestMatch.CREATED, "Diff:", Math.round(minDiff / 1000), "segundos");
-        console.log("SETTINGS:", JSON.stringify(bestMatch.SETTINGS));
+      // Calcular diferença de tempo com a criação do negócio
+      const actTime = new Date(act.CREATED).getTime();
+      const diff = Math.abs(dealTime - actTime);
 
-        if (bestMatch.SETTINGS?.MISSED_CALL === true) {
-          passouURA = "Sim";
-        }
-      }
-    } else if (matchingActivities.length === 1) {
-      bestMatch = matchingActivities[0];
-      if (bestMatch.SETTINGS?.MISSED_CALL === true) {
-        passouURA = "Sim";
+      if (diff < closestDiff) {
+        closestDiff = diff;
+        closestActivity = act;
       }
     }
 
-    console.log("Resultado: passouURA =", passouURA);
+    if (!closestActivity) {
+      console.log(`[v4] Nenhuma atividade correspondente ao telefone`);
+      await atualizarCampo(dealId, "1689");
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
+          status: "ok",
+          dealId,
+          phone,
+          passouURA: "Não",
+          motivo: "Nenhuma atividade correspondente ao telefone",
+        }),
+      };
+    }
 
-    // 6. ATUALIZAR CAMPO NO NEGÓCIO
-    const updateResult = await updateDeal(BITRIX_WEBHOOK, dealId, CAMPO_URA, passouURA);
+    console.log(`[v4] Atividade selecionada: ${closestActivity.ID}`);
+    console.log(`[v4] ORIGIN_ID: ${closestActivity.ORIGIN_ID}`);
+    console.log(`[v4] Criada em: ${closestActivity.CREATED}`);
 
-    console.log("=== VERIFICAR URA v3 - FIM ===");
+    // 6. Extrair CALL_ID do ORIGIN_ID (remover prefixo "VI_")
+    const originId = closestActivity.ORIGIN_ID || "";
+    const callId = originId.startsWith("VI_") ? originId.substring(3) : originId;
+
+    if (!callId) {
+      console.log(`[v4] ORIGIN_ID vazio — impossível buscar CALL_LOG`);
+      // Fallback: usa MISSED_CALL como antes
+      const missedCall = closestActivity.SETTINGS && closestActivity.SETTINGS.MISSED_CALL;
+      const resultado = missedCall ? "1687" : "1689";
+      await atualizarCampo(dealId, resultado);
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
+          status: "ok",
+          dealId,
+          phone,
+          passouURA: missedCall ? "Sim (fallback MISSED_CALL)" : "Não",
+          motivo: "ORIGIN_ID vazio, usado fallback MISSED_CALL",
+        }),
+      };
+    }
+
+    console.log(`[v4] CALL_ID: ${callId}`);
+
+    // 7. Buscar estatísticas da chamada no Voximplant
+    const voxUrl = `${BITRIX_WEBHOOK}/voximplant.statistic.get?FILTER[CALL_ID]=${callId}`;
+    const voxRes = await fetch(voxUrl);
+    const voxData = await voxRes.json();
+
+    console.log(`[v4] Voximplant resultados: ${voxData.result ? voxData.result.length : 0}`);
+
+    if (!voxData.result || voxData.result.length === 0) {
+      console.log(`[v4] Chamada não encontrada no Voximplant — marca como Não`);
+      await atualizarCampo(dealId, "1689");
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
+          status: "ok",
+          dealId,
+          phone,
+          callId,
+          passouURA: "Não",
+          motivo: "Chamada não encontrada no voximplant.statistic.get",
+        }),
+      };
+    }
+
+    const callStat = voxData.result[0];
+    const callLogUrl = callStat.CALL_LOG;
+
+    if (!callLogUrl) {
+      console.log(`[v4] CALL_LOG vazio — marca como Não`);
+      await atualizarCampo(dealId, "1689");
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
+          status: "ok",
+          dealId,
+          phone,
+          callId,
+          passouURA: "Não",
+          motivo: "CALL_LOG URL vazio",
+        }),
+      };
+    }
+
+    console.log(`[v4] CALL_LOG URL obtida, buscando conteúdo...`);
+
+    // 8. Fazer fetch do CALL_LOG e procurar por "Call.ToneReceived"
+    const logRes = await fetch(callLogUrl);
+    const logText = await logRes.text();
+
+    console.log(`[v4] CALL_LOG tamanho: ${logText.length} caracteres`);
+
+    const toneReceived = logText.includes("Call.ToneReceived");
+
+    console.log(`[v4] Call.ToneReceived encontrado: ${toneReceived}`);
+
+    // 9. Atualizar campo no negócio
+    const enumId = toneReceived ? "1687" : "1689"; // 1687=Sim, 1689=Não
+    const updateResult = await atualizarCampo(dealId, enumId);
+
+    const resultado = {
+      status: "ok",
+      dealId,
+      phone,
+      callId,
+      activityId: closestActivity.ID,
+      activityCreated: closestActivity.CREATED,
+      dealCreated,
+      callDuration: callStat.CALL_DURATION,
+      toneReceived,
+      passouURA: toneReceived ? "Sim" : "Não",
+      updateResult,
+    };
+
+    console.log(`[v4] Resultado:`, JSON.stringify(resultado));
 
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        status: "ok",
-        dealId,
-        phone,
-        passouURA,
-        activityFound: bestMatch?.ID || null,
-        activityCreated: bestMatch?.CREATED || null,
-        dealCreated: dateCreate,
-        updateResult,
-      }),
+      body: JSON.stringify(resultado),
     };
   } catch (error) {
-    console.error("ERRO:", error.message);
-    return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
+    console.error(`[v4] Erro:`, error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: error.message }),
+    };
   }
 };
 
-// ATUALIZAR CAMPO NO NEGÓCIO
-async function updateDeal(webhookUrl, dealId, fieldCode, value) {
-  const enumValue = value === "Sim" ? "1687" : "1689";
-  const url = `${webhookUrl}/crm.deal.update?id=${dealId}&fields[${fieldCode}]=${enumValue}`;
-  console.log("Update URL:", url);
-  try {
-    const res = await fetch(url);
-    const data = await res.json();
-    console.log("Update response:", JSON.stringify(data));
-    return data;
-  } catch (err) {
-    console.error("Update error:", err.message);
-    return { error: err.message };
-  }
+// Função auxiliar para atualizar o campo "Passou pela URA" no negócio
+async function atualizarCampo(dealId, enumId) {
+  const url = `${BITRIX_WEBHOOK}/crm.deal.update?id=${dealId}&fields[UF_CRM_1772056801]=${enumId}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  console.log(`[v4] Campo atualizado: dealId=${dealId}, valor=${enumId === "1687" ? "Sim" : "Não"}, resultado=${JSON.stringify(data)}`);
+  return data;
 }
